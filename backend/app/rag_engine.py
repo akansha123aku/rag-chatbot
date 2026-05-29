@@ -3,13 +3,12 @@ import os
 from typing import Dict, Any, List
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import numpy as np
 import logging
+from langchain_groq import ChatGroq, GroqEmbeddings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,10 +17,10 @@ class RAGEngine:
     def __init__(self, groq_api_key: str):
         logger.info("Initializing RAG Engine...")
         
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
+        # Changed from HuggingFaceEmbeddings to GroqEmbeddings to reduce memory
+        self.embeddings = GroqEmbeddings(
+            api_key=groq_api_key,
+            model="text-embedding-3-large"  # Groq's embed model
         )
         
         self.llm = ChatGroq(
