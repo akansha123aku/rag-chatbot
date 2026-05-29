@@ -4,7 +4,6 @@ python-dotenv
 langchain
 langchain-community
 langchain-groq
-faiss-cpu
 pypdf
 numpy
 pandas

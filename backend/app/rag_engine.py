@@ -2,13 +2,11 @@ import tempfile
 import os
 from typing import Dict, Any, List
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 import numpy as np
 import logging
-from langchain_groq import ChatGroq, GroqEmbeddings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,12 +15,7 @@ class RAGEngine:
     def __init__(self, groq_api_key: str):
         logger.info("Initializing RAG Engine...")
         
-        # Changed from HuggingFaceEmbeddings to GroqEmbeddings to reduce memory
-        self.embeddings = GroqEmbeddings(
-            api_key=groq_api_key,
-            model="text-embedding-3-large"  # Groq's embed model
-        )
-        
+        # Use Groq for LLM only (no local embeddings needed)
         self.llm = ChatGroq(
             api_key=groq_api_key,
             model="llama-3.3-70b-versatile",
@@ -30,7 +23,7 @@ class RAGEngine:
             max_tokens=500
         )
         
-        self.vector_store = None
+        self.chunks = []  # Store chunks in memory (no FAISS needed)
         
         self.prompts = {
             "zero_shot": """You are a strict assistant. Answer ONLY using the provided context below.
@@ -49,10 +42,6 @@ Example 1:
 Question: What is the leave policy?
 Answer: According to the document, employees receive 20 paid leave days per year.
 
-Example 2:
-Question: Can employees work remotely?
-Answer: The handbook states that remote work is permitted on Mondays and Fridays.
-
 Now answer this question using the SAME format (start with "According to the document"):
 
 Context: {context}
@@ -61,16 +50,15 @@ Question: {question}
 
 Answer: According to the document,""",
             
-            "chain_of_thought": """You are a reasoning assistant. Think step by step before answering.
+            "chain_of_thought": """You are a reasoning assistant. Think step by step.
 
 Context: {context}
 
 Question: {question}
 
-Let me reason through this step by step:
-1. First, I need to identify what the document says about this topic.
-2. The relevant information from the context is: [find the key facts]
-3. Based on these facts, the answer to the question is:
+Let me reason step by step:
+1. First, identify what the document says about this topic.
+2. Based on these facts, the answer is:
 
 Answer:"""
         }
@@ -87,23 +75,27 @@ Answer:"""
             documents = loader.load()
             logger.info(f"Loaded {len(documents)} pages")
             
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50,
-                separators=["\n\n", "\n", " ", ""]
-            )
-            chunks = text_splitter.split_documents(documents)
-            logger.info(f"Created {len(chunks)} chunks")
+            # Simple chunking - split by paragraphs and words
+            chunks = []
+            for doc in documents:
+                text = doc.page_content
+                # Split by double newline (paragraphs)
+                paragraphs = text.split('\n\n')
+                for para in paragraphs:
+                    if len(para) > 100:  # Only keep meaningful paragraphs
+                        chunks.append(Document(page_content=para.strip(), metadata=doc.metadata))
+                    else:
+                        # For short paragraphs, keep as is
+                        chunks.append(Document(page_content=para.strip(), metadata=doc.metadata))
             
-            self.vector_store = FAISS.from_documents(chunks, self.embeddings)
+            self.chunks = chunks
+            logger.info(f"Created {len(chunks)} chunks")
             
             stats = {
                 "num_chunks": int(len(chunks)),
                 "total_pages": len(documents),
                 "filename": pdf_file.filename
             }
-            
-            self.vector_store.save_local("faiss_index")
             
             return {"status": "success", "stats": stats}
             
@@ -114,7 +106,7 @@ Answer:"""
             os.unlink(tmp_path)
     
     def ask(self, question: str, prompt_type: str = "zero_shot", k: int = 8) -> Dict[str, Any]:
-        if not self.vector_store:
+        if not self.chunks:
             return {
                 "answer": "Please upload a PDF first.",
                 "retrieved_chunks": 0,
@@ -122,16 +114,24 @@ Answer:"""
             }
         
         try:
-            docs = self.vector_store.similarity_search(question, k=k)
+            # Simple keyword-based retrieval (no embeddings needed!)
+            scored_chunks = []
+            question_words = set(question.lower().split())
             
-            if not docs:
-                return {
-                    "answer": "No relevant information found.",
-                    "retrieved_chunks": 0,
-                    "prompt_type": prompt_type
-                }
+            for chunk in self.chunks:
+                chunk_text = chunk.page_content.lower()
+                # Count how many question words appear in the chunk
+                score = sum(1 for word in question_words if word in chunk_text)
+                # Also check for word boundaries (higher weight for exact matches)
+                scored_chunks.append((score, chunk))
             
-            context = "\n\n---\n\n".join([doc.page_content for doc in docs])
+            # Sort by score (highest first)
+            scored_chunks.sort(reverse=True, key=lambda x: x[0])
+            
+            # Get top k chunks
+            top_chunks = [chunk for _, chunk in scored_chunks[:k]]
+            
+            context = "\n\n---\n\n".join([chunk.page_content for chunk in top_chunks])
             
             template = self.prompts.get(prompt_type, self.prompts["zero_shot"])
             final_prompt = template.format(context=context, question=question)
@@ -146,7 +146,7 @@ Answer:"""
             
             return {
                 "answer": answer,
-                "retrieved_chunks": len(docs),
+                "retrieved_chunks": len(top_chunks),
                 "prompt_type": prompt_type
             }
             
