@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from app.models import ChatRequest, ChatResponse
 from app.rag_engine import RAGEngine
 
-load_dotenv()
+from pathlib import Path; load_dotenv(Path(__file__).parent.parent / ".env")
 
 app = FastAPI(title="RAG Q&A Chatbot", version="1.0.0")
 

@@ -5,7 +5,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
-import numpy as np
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +15,6 @@ class RAGEngine:
     def __init__(self, groq_api_key: str):
         logger.info("Initializing RAG Engine...")
         
-        # Use Groq for LLM only (no local embeddings needed)
         self.llm = ChatGroq(
             api_key=groq_api_key,
             model="llama-3.3-70b-versatile",
@@ -23,7 +22,8 @@ class RAGEngine:
             max_tokens=500
         )
         
-        self.chunks = []  # Store chunks in memory (no FAISS needed)
+        self.chunks = []
+        self.vector_store = None
         
         self.prompts = {
             "zero_shot": """You are a strict assistant. Answer ONLY using the provided context below.
@@ -36,30 +36,21 @@ Question: {question}
 
 Answer:""",
             
-            "few_shot": """You are a helpful assistant. Follow the examples below when answering.
+            "few_shot": """Examples:
+Q: What is the leave policy?
+A: According to the document, employees receive 20 paid leave days.
 
-Example 1:
-Question: What is the leave policy?
-Answer: According to the document, employees receive 20 paid leave days per year.
-
-Now answer this question using the SAME format (start with "According to the document"):
-
+Now answer using the SAME format:
 Context: {context}
-
 Question: {question}
-
 Answer: According to the document,""",
             
-            "chain_of_thought": """You are a reasoning assistant. Think step by step.
+            "chain_of_thought": """Reason step by step.
 
 Context: {context}
-
 Question: {question}
 
-Let me reason step by step:
-1. First, identify what the document says about this topic.
-2. Based on these facts, the answer is:
-
+Let me think step by step:
 Answer:"""
         }
         
@@ -75,24 +66,19 @@ Answer:"""
             documents = loader.load()
             logger.info(f"Loaded {len(documents)} pages")
             
-            # Simple chunking - split by paragraphs and words
-            chunks = []
-            for doc in documents:
-                text = doc.page_content
-                # Split by double newline (paragraphs)
-                paragraphs = text.split('\n\n')
-                for para in paragraphs:
-                    if len(para) > 100:  # Only keep meaningful paragraphs
-                        chunks.append(Document(page_content=para.strip(), metadata=doc.metadata))
-                    else:
-                        # For short paragraphs, keep as is
-                        chunks.append(Document(page_content=para.strip(), metadata=doc.metadata))
+            # Smaller chunks to avoid token limits
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=300,
+                chunk_overlap=50,
+                separators=["\n\n", "\n", " ", ""]
+            )
+            chunks = text_splitter.split_documents(documents)
             
             self.chunks = chunks
-            logger.info(f"Created {len(chunks)} chunks")
+            self.vector_store = type('Dummy', (), {'__bool__': lambda self: True})()
             
             stats = {
-                "num_chunks": int(len(chunks)),
+                "num_chunks": len(chunks),
                 "total_pages": len(documents),
                 "filename": pdf_file.filename
             }
@@ -100,7 +86,7 @@ Answer:"""
             return {"status": "success", "stats": stats}
             
         except Exception as e:
-            logger.error(f"Ingestion failed: {str(e)}")
+            logger.error(f"Ingestion failed: {e}")
             raise
         finally:
             os.unlink(tmp_path)
@@ -114,30 +100,24 @@ Answer:"""
             }
         
         try:
-            # Simple keyword-based retrieval (no embeddings needed!)
-            scored_chunks = []
             question_words = set(question.lower().split())
+            scored = []
             
             for chunk in self.chunks:
                 chunk_text = chunk.page_content.lower()
-                # Count how many question words appear in the chunk
                 score = sum(1 for word in question_words if word in chunk_text)
-                # Also check for word boundaries (higher weight for exact matches)
-                scored_chunks.append((score, chunk))
+                scored.append((score, chunk))
             
-            # Sort by score (highest first)
-            scored_chunks.sort(reverse=True, key=lambda x: x[0])
+            scored.sort(reverse=True, key=lambda x: x[0])
+            top_chunks = [chunk for _, chunk in scored[:k]]
             
-            # Get top k chunks
-            top_chunks = [chunk for _, chunk in scored_chunks[:k]]
-            
-            context = "\n\n---\n\n".join([chunk.page_content for chunk in top_chunks])
+            context = "\n\n---\n\n".join([c.page_content for c in top_chunks])
             
             template = self.prompts.get(prompt_type, self.prompts["zero_shot"])
             final_prompt = template.format(context=context, question=question)
             
             messages = [
-                SystemMessage(content="You are a helpful AI assistant."),
+                SystemMessage(content="You are a helpful assistant."),
                 HumanMessage(content=final_prompt)
             ]
             
@@ -151,7 +131,7 @@ Answer:"""
             }
             
         except Exception as e:
-            logger.error(f"Error: {str(e)}")
+            logger.error(f"Ask failed: {e}")
             return {
                 "answer": f"Error: {str(e)}",
                 "retrieved_chunks": 0,
